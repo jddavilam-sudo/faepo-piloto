@@ -49,7 +49,10 @@ def cargar_desde_supabase(url: str, clave: str):
             params={"select": "*", "limit": 1000},
             headers=headers, timeout=15,
         )
-        respuesta.raise_for_status()
+        if not respuesta.ok:
+    raise RuntimeError(
+        f"Supabase respondió {respuesta.status_code}: {respuesta.text[:400]}"
+    )
         return respuesta.json()
     comunicaciones = pd.DataFrame(leer("comunicaciones"))
     programas = pd.DataFrame(leer("programas"))
