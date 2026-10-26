@@ -9,6 +9,7 @@ from datetime import date
 from io import BytesIO
 import html
 import re
+import requests
 
 import pandas as pd
 import plotly.express as px
@@ -34,6 +35,53 @@ if "catalogo" not in st.session_state:
     st.session_state.catalogo = sorted({x["programa"] for x in DEMO})
 if "seccion" not in st.session_state:
     st.session_state.seccion = "Inicio"
+
+
+# El piloto remoto consulta datos de demostración con la clave publicable.
+# NO almacena credenciales en GitHub y NO autoriza escrituras públicas.
+@st.cache_data(ttl=45, show_spinner=False)
+def cargar_desde_supabase(url: str, clave: str):
+    url = url.rstrip("/")
+    headers = {"apikey": clave, "Accept": "application/json"}
+    def leer(tabla):
+        respuesta = requests.get(
+            f"{url}/rest/v1/{tabla}",
+            params={"select": "*", "limit": 1000},
+            headers=headers, timeout=15,
+        )
+        respuesta.raise_for_status()
+        return respuesta.json()
+    comunicaciones = pd.DataFrame(leer("comunicaciones"))
+    programas = pd.DataFrame(leer("programas"))
+    solicitudes = pd.DataFrame(leer("solicitudes"))
+    if any(frame.empty for frame in [comunicaciones, programas, solicitudes]):
+        return []
+    joined = solicitudes.merge(
+        comunicaciones, left_on="comunicacion_id", right_on="id", suffixes=("_sol", "_com")
+    ).merge(programas, left_on="programa_id", right_on="id", suffixes=("", "_prog"))
+    rows = []
+    for _, row in joined.iterrows():
+        rows.append(dict(
+            gs=str(row["numero_gs"]), fecha=str(row["fecha_solicitud"]),
+            unidad=str(row["unidad_solicitante"]), vigencia=int(row["vigencia"]),
+            programa=str(row["nombre"]), cupos=int(row["cupos_solicitados"]),
+            asignados=int(row["cupos_asignados"]), estado=str(row["estado"]),
+            nota=str(row.get("observaciones_sol", row.get("observaciones", "")) or ""),
+        ))
+    return rows
+
+remote_enabled = False
+remote_error = None
+try:
+    remote_url = st.secrets.get("SUPABASE_URL", "")
+    remote_key = st.secrets.get("SUPABASE_PUBLISHABLE_KEY", "")
+    if remote_url and remote_key:
+        remote_enabled = True
+        remote_rows = cargar_desde_supabase(remote_url, remote_key)
+        st.session_state.registros = remote_rows
+        st.session_state.catalogo = sorted({r["programa"] for r in remote_rows})
+except Exception as error:
+    remote_error = str(error)
 
 STYLE = """
 <style>
@@ -123,14 +171,26 @@ with st.sidebar:
     current=st.radio("NAVEGACIÓN",sections,index=sections.index(st.session_state.seccion),format_func=lambda x:f'{icons[x]}   {x}')
     st.session_state.seccion=current
     st.divider()
-    st.caption("PILOTO 2.0 · DATOS FICTICIOS")
-    st.caption("Datos temporales por sesión. No publicar información institucional real.")
+    st.caption("PILOTO 3.0 · SOLO DATOS FICTICIOS")
+    st.caption("Lectura compartida · registro y edición aún no habilitados.")
 
 st.markdown('''<div class="faepo-head"><small>POLICÍA NACIONAL · DIRECCIÓN DE EDUCACIÓN POLICIAL</small><strong>FAEPO | Control de solicitudes académicas</strong><span>Demanda de cupos · Comunicaciones oficiales · Seguimiento de programas</span></div>''',unsafe_allow_html=True)
-st.markdown('<div class="demo">⚠ PILOTO DE DEMOSTRACIÓN — No tiene usuarios, base de datos compartida ni persistencia. Los registros son ficticios; no introducir datos institucionales reales.</div>',unsafe_allow_html=True)
+if remote_enabled:
+    st.info("🔗 Datos de prueba obtenidos de PostgreSQL (Supabase). Lectura compartida; edición deshabilitada. No introducir datos institucionales reales.")
+    if remote_error:
+        st.error("No fue posible consultar Supabase. Revise los secretos, los permisos SELECT y la conexión. Detalle técnico: " + remote_error)
+else:
+    st.warning("🧪 Modo local sin conexión a Supabase: se muestran datos ficticios temporales. No introducir información institucional real.")
+    if remote_error:
+        st.error("Error de configuración: " + remote_error)
+
 
 df=df_all()
 unique_gs=df.gs.nunique()
+
+if df.empty:
+    st.warning("La base de datos no devolvió registros visibles. Verifique las políticas RLS y los permisos SELECT.")
+    st.stop()
 
 if current=="Inicio":
     m1,m2,m3,m4=st.columns(4)
@@ -191,6 +251,10 @@ elif current=="Programas académicos":
     s=subset.groupby("unidad",as_index=False)["cupos"].sum().sort_values("cupos",ascending=False)
     st.plotly_chart(plot_bar(s,"unidad","cupos"),use_container_width=True)
 
+elif current=="Registrar solicitud" and remote_enabled:
+    st.subheader("Registrar nueva solicitud")
+    st.warning("Registro temporalmente inhabilitado en la versión compartida. La escritura se habilitará tras implementar autenticación y autorización por usuario.")
+
 elif current=="Registrar solicitud":
     st.subheader("Registrar nueva solicitud")
     st.caption("Un número GS puede tener varios programas. Registre primero los datos de la comunicación y luego cada programa solicitado.")
@@ -228,6 +292,10 @@ elif current=="Registrar solicitud":
             elif new.strip().casefold() in {x.casefold() for x in st.session_state.catalogo}:st.warning("El programa ya existe.")
             else:
                 st.session_state.catalogo.append(new.strip());st.session_state.catalogo.sort();st.success("Programa agregado temporalmente.")
+
+elif current=="Gestionar cupos" and remote_enabled:
+    st.subheader("Gestionar cupos")
+    st.warning("Edición temporalmente inhabilitada en la versión compartida. Aquí implementaremos actualizaciones con trazabilidad una vez exista autenticación.")
 
 elif current=="Gestionar cupos":
     st.subheader("Actualizar seguimiento de una solicitud")
@@ -268,11 +336,12 @@ elif current=="Reportes y catálogo":
     st.download_button("⬇ Exportar registros CSV",df.to_csv(index=False).encode("utf-8-sig"),"FAEPO_DEMO_Registros.csv",mime="text/csv")
     with st.expander("Catálogo de programas"):
         st.dataframe(pd.DataFrame({"Denominación":st.session_state.catalogo}),hide_index=True,use_container_width=True)
-    with st.expander("Reiniciar todos los datos ficticios"):
-        st.warning("Solo afecta a la demostración de esta pestaña.")
-        if st.button("Restaurar datos de ejemplo"):
-            st.session_state.registros=[dict(x) for x in DEMO]
-            st.session_state.catalogo=sorted({x["programa"] for x in DEMO})
-            st.rerun()
+    if not remote_enabled:
+      with st.expander("Reiniciar todos los datos ficticios"):
+          st.warning("Solo afecta a la demostración de esta pestaña.")
+          if st.button("Restaurar datos de ejemplo"):
+              st.session_state.registros=[dict(x) for x in DEMO]
+              st.session_state.catalogo=sorted({x["programa"] for x in DEMO})
+              st.rerun()
 
-st.caption("FAEPO · Piloto visual 2.0 | Sin conexión al GEPol, SIGAC ni otros sistemas institucionales.")
+st.caption("FAEPO · Piloto 3.0 | Conexión de demostración Supabase, sin acceso a GEPol o SIGAC. No habilitado para datos institucionales reales.")
